@@ -70,10 +70,117 @@
 //! 4. Pass a clone of the `AndroidApp` that your application receives to Winit when building your
 //!    event loop (as shown above).
 
+use std::collections::VecDeque;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+
+use crate::dpi::PhysicalPosition;
+use crate::event::{DeviceId, ElementState, MouseButton};
 use crate::event_loop::{ActiveEventLoop, EventLoop, EventLoopBuilder};
 use crate::window::{Window, WindowAttributes};
 
 use self::activity::{AndroidApp, ConfigurationRef, Rect};
+
+/// Identifies the Android stylus tool that produced a standard pointer event.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StylusTool {
+    /// A pen tip.
+    Pen,
+    /// The eraser end of a stylus.
+    Eraser,
+}
+
+/// Identifies the standard window event annotated by a [`StylusEvent`].
+///
+/// The matching [`crate::event::WindowEvent`] is still emitted normally. This value only carries
+/// stylus metadata that the standard pointer event cannot represent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StylusEventKind {
+    /// Annotates a [`crate::event::WindowEvent::CursorMoved`] event.
+    CursorMoved,
+    /// Annotates a [`crate::event::WindowEvent::MouseInput`] event.
+    MouseInput {
+        /// Whether the matching button was pressed or released.
+        state: ElementState,
+        /// The button reported by the matching pointer event.
+        button: MouseButton,
+    },
+    /// Annotates a [`crate::event::WindowEvent::CursorLeft`] event.
+    CursorLeft,
+}
+
+/// Stylus metadata for one standard pointer event emitted by the Android backend.
+///
+/// This event does not replace the corresponding pointer event and must not be interpreted as a
+/// second click. It can be paired with the standard event to retain pressure and tool identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StylusEvent {
+    /// Device that produced the event.
+    pub device_id: DeviceId,
+    /// Android pointer identifier within the device.
+    pub pointer_id: u64,
+    /// Position in physical pixels.
+    pub position: PhysicalPosition<f64>,
+    /// Pressure reported by Android.
+    pub pressure: f32,
+    /// Pen tip or eraser tool.
+    pub tool: StylusTool,
+    /// Standard pointer event annotated by this value.
+    pub kind: StylusEventKind,
+}
+
+#[derive(Default)]
+struct StylusEventQueueState {
+    events: VecDeque<StylusEvent>,
+}
+
+/// Producer handle installed on the Android event loop.
+#[derive(Clone)]
+pub struct StylusEventSink {
+    state: Arc<Mutex<StylusEventQueueState>>,
+}
+
+impl fmt::Debug for StylusEventSink {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("StylusEventSink").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for StylusEventSink {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl StylusEventSink {
+    pub(crate) fn push(&self, event: StylusEvent) {
+        self.state.lock().expect("stylus event queue poisoned").events.push_back(event);
+    }
+}
+
+/// Consumer handle used to drain stylus metadata before an application processes input.
+pub struct StylusEventReceiver {
+    state: Arc<Mutex<StylusEventQueueState>>,
+}
+
+impl fmt::Debug for StylusEventReceiver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("StylusEventReceiver").finish_non_exhaustive()
+    }
+}
+
+impl StylusEventReceiver {
+    /// Removes and returns all queued events in emission order.
+    pub fn drain(&self) -> Vec<StylusEvent> {
+        self.state.lock().expect("stylus event queue poisoned").events.drain(..).collect()
+    }
+}
+
+/// Creates the producer and consumer used to retain Android stylus metadata.
+pub fn stylus_event_channel() -> (StylusEventSink, StylusEventReceiver) {
+    let state = Arc::new(Mutex::new(StylusEventQueueState::default()));
+    (StylusEventSink { state: Arc::clone(&state) }, StylusEventReceiver { state })
+}
 
 /// Additional methods on [`EventLoop`] that are specific to Android.
 pub trait EventLoopExtAndroid {
@@ -131,6 +238,9 @@ pub trait EventLoopBuilderExtAndroid {
     ///
     /// Default is to let the operating system handle the volume keys
     fn handle_volume_keys(&mut self) -> &mut Self;
+
+    /// Installs a sink for metadata belonging to standard pointer events emitted by a stylus.
+    fn with_stylus_event_sink(&mut self, sink: StylusEventSink) -> &mut Self;
 }
 
 impl<T> EventLoopBuilderExtAndroid for EventLoopBuilder<T> {
@@ -141,6 +251,11 @@ impl<T> EventLoopBuilderExtAndroid for EventLoopBuilder<T> {
 
     fn handle_volume_keys(&mut self) -> &mut Self {
         self.platform_specific.ignore_volume_keys = false;
+        self
+    }
+
+    fn with_stylus_event_sink(&mut self, sink: StylusEventSink) -> &mut Self {
+        self.platform_specific.stylus_event_sink = Some(sink);
         self
     }
 }

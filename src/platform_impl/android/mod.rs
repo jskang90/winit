@@ -20,6 +20,7 @@ use crate::error;
 use crate::error::EventLoopError;
 use crate::event::{self, Force, InnerSizeWriter, StartCause};
 use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents};
+use crate::platform::android::{StylusEvent, StylusEventKind, StylusEventSink, StylusTool};
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
 use crate::window::{
@@ -69,6 +70,15 @@ fn tool_type_is_pointer_like(tool_type: ToolType) -> bool {
 
 fn tool_type_is_touch_like(tool_type: ToolType) -> bool {
     matches!(tool_type, ToolType::Finger)
+}
+
+fn stylus_tool(source: Source, tool_type: ToolType) -> Option<StylusTool> {
+    match tool_type {
+        ToolType::Eraser => Some(StylusTool::Eraser),
+        ToolType::Stylus => Some(StylusTool::Pen),
+        _ if matches!(source, Source::BluetoothStylus | Source::Stylus) => Some(StylusTool::Pen),
+        _ => None,
+    }
 }
 
 fn action_is_hover_like(action: MotionAction) -> bool {
@@ -238,18 +248,21 @@ pub struct EventLoop<T: 'static> {
     combining_accent: Option<char>,
     pointer_mouse_buttons: HashMap<(i32, u64), event::MouseButton>,
     pointer_like_contacts: HashSet<(i32, u64)>,
+    stylus_contacts: HashMap<(i32, u64), StylusTool>,
     recent_pointer_like: Option<RecentPointerLike>,
+    stylus_event_sink: Option<StylusEventSink>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlatformSpecificEventLoopAttributes {
     pub(crate) android_app: Option<AndroidApp>,
     pub(crate) ignore_volume_keys: bool,
+    pub(crate) stylus_event_sink: Option<StylusEventSink>,
 }
 
 impl Default for PlatformSpecificEventLoopAttributes {
     fn default() -> Self {
-        Self { android_app: Default::default(), ignore_volume_keys: true }
+        Self { android_app: Default::default(), ignore_volume_keys: true, stylus_event_sink: None }
     }
 }
 
@@ -266,6 +279,7 @@ impl<T: 'static> EventLoop<T> {
         let redraw_flag = SharedFlag::new();
 
         android_app.enable_motion_axis(Axis::Hscroll);
+        android_app.enable_motion_axis(Axis::Pressure);
         android_app.enable_motion_axis(Axis::Vscroll);
 
         Ok(Self {
@@ -293,8 +307,25 @@ impl<T: 'static> EventLoop<T> {
             combining_accent: None,
             pointer_mouse_buttons: HashMap::new(),
             pointer_like_contacts: HashSet::new(),
+            stylus_contacts: HashMap::new(),
             recent_pointer_like: None,
+            stylus_event_sink: attributes.stylus_event_sink.clone(),
         })
+    }
+
+    fn queue_stylus_event(
+        &self,
+        device_id: event::DeviceId,
+        pointer_id: u64,
+        position: PhysicalPosition<f64>,
+        pressure: f32,
+        tool: Option<StylusTool>,
+        kind: StylusEventKind,
+    ) {
+        let (Some(sink), Some(tool)) = (&self.stylus_event_sink, tool) else {
+            return;
+        };
+        sink.push(StylusEvent { device_id, pointer_id, position, pressure, tool, kind });
     }
 
     fn single_iteration<F>(&mut self, main_event: Option<MainEvent<'_>>, callback: &mut F)
@@ -493,6 +524,9 @@ impl<T: 'static> EventLoop<T> {
                     let pointer_id = pointer.pointer_id() as u64;
                     let pointer_key = (raw_device_id, pointer_id);
                     let location = PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
+                    let pressure = pointer.pressure();
+                    let current_stylus_tool = stylus_tool(source, pointer.tool_type())
+                        .or_else(|| self.stylus_contacts.get(&pointer_key).copied());
                     let explicit_touch_like = source_is_touch_like(source)
                         || tool_type_is_touch_like(pointer.tool_type());
                     let explicit_pointer_like = source_is_pointer_like(source)
@@ -534,7 +568,19 @@ impl<T: 'static> EventLoop<T> {
                             self.pointer_like_contacts.insert(pointer_key);
                         }
 
+                        if let Some(tool) = current_stylus_tool {
+                            self.stylus_contacts.insert(pointer_key, tool);
+                        }
+
                         if !matches!(action, MotionAction::HoverExit | MotionAction::Cancel) {
+                            self.queue_stylus_event(
+                                device_id,
+                                pointer_id,
+                                location,
+                                pressure,
+                                current_stylus_tool,
+                                StylusEventKind::CursorMoved,
+                            );
                             callback(
                                 event::Event::WindowEvent {
                                     window_id,
@@ -551,6 +597,17 @@ impl<T: 'static> EventLoop<T> {
                             MotionAction::Down | MotionAction::PointerDown => {
                                 let button = motion_event_mouse_button(motion_event);
                                 self.pointer_mouse_buttons.insert(pointer_key, button);
+                                self.queue_stylus_event(
+                                    device_id,
+                                    pointer_id,
+                                    location,
+                                    pressure,
+                                    current_stylus_tool,
+                                    StylusEventKind::MouseInput {
+                                        state: event::ElementState::Pressed,
+                                        button,
+                                    },
+                                );
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -569,6 +626,17 @@ impl<T: 'static> EventLoop<T> {
                                     .pointer_mouse_buttons
                                     .remove(&pointer_key)
                                     .unwrap_or_else(|| motion_event_mouse_button(motion_event));
+                                self.queue_stylus_event(
+                                    device_id,
+                                    pointer_id,
+                                    location,
+                                    pressure,
+                                    current_stylus_tool,
+                                    StylusEventKind::MouseInput {
+                                        state: event::ElementState::Released,
+                                        button,
+                                    },
+                                );
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -584,6 +652,17 @@ impl<T: 'static> EventLoop<T> {
                             MotionAction::ButtonPress => {
                                 let button = motion_event_mouse_button(motion_event);
                                 self.pointer_mouse_buttons.insert(pointer_key, button);
+                                self.queue_stylus_event(
+                                    device_id,
+                                    pointer_id,
+                                    location,
+                                    pressure,
+                                    current_stylus_tool,
+                                    StylusEventKind::MouseInput {
+                                        state: event::ElementState::Pressed,
+                                        button,
+                                    },
+                                );
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -607,6 +686,17 @@ impl<T: 'static> EventLoop<T> {
                                     });
                                 self.pointer_mouse_buttons.remove(&pointer_key);
                                 if let Some(button) = button {
+                                    self.queue_stylus_event(
+                                        device_id,
+                                        pointer_id,
+                                        location,
+                                        pressure,
+                                        current_stylus_tool,
+                                        StylusEventKind::MouseInput {
+                                            state: event::ElementState::Released,
+                                            button,
+                                        },
+                                    );
                                     callback(
                                         event::Event::WindowEvent {
                                             window_id,
@@ -625,6 +715,17 @@ impl<T: 'static> EventLoop<T> {
                                 if let Some(button) =
                                     self.pointer_mouse_buttons.remove(&pointer_key)
                                 {
+                                    self.queue_stylus_event(
+                                        device_id,
+                                        pointer_id,
+                                        location,
+                                        pressure,
+                                        current_stylus_tool,
+                                        StylusEventKind::MouseInput {
+                                            state: event::ElementState::Released,
+                                            button,
+                                        },
+                                    );
                                     callback(
                                         event::Event::WindowEvent {
                                             window_id,
@@ -637,6 +738,14 @@ impl<T: 'static> EventLoop<T> {
                                         self.window_target(),
                                     );
                                 }
+                                self.queue_stylus_event(
+                                    device_id,
+                                    pointer_id,
+                                    location,
+                                    pressure,
+                                    current_stylus_tool,
+                                    StylusEventKind::CursorLeft,
+                                );
                                 callback(
                                     event::Event::WindowEvent {
                                         window_id,
@@ -667,6 +776,15 @@ impl<T: 'static> EventLoop<T> {
                             | MotionAction::HoverMove
                             | MotionAction::Move => {},
                             _ => {},
+                        }
+                        if matches!(
+                            action,
+                            MotionAction::Up
+                                | MotionAction::PointerUp
+                                | MotionAction::HoverExit
+                                | MotionAction::Cancel
+                        ) {
+                            self.stylus_contacts.remove(&pointer_key);
                         }
                         return input_status;
                     }
