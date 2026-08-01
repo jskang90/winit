@@ -72,7 +72,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::dpi::PhysicalPosition;
 use crate::event::{DeviceId, ElementState, MouseButton};
@@ -137,7 +137,7 @@ struct StylusEventQueueState {
 /// Producer handle installed on the Android event loop.
 #[derive(Clone)]
 pub struct StylusEventSink {
-    state: Arc<Mutex<StylusEventQueueState>>,
+    state: Weak<Mutex<StylusEventQueueState>>,
 }
 
 impl fmt::Debug for StylusEventSink {
@@ -148,13 +148,16 @@ impl fmt::Debug for StylusEventSink {
 
 impl PartialEq for StylusEventSink {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.state, &other.state)
+        Weak::ptr_eq(&self.state, &other.state)
     }
 }
 
 impl StylusEventSink {
     pub(crate) fn push(&self, event: StylusEvent) {
-        self.state.lock().expect("stylus event queue poisoned").events.push_back(event);
+        let Some(state) = self.state.upgrade() else {
+            return;
+        };
+        state.lock().expect("stylus event queue poisoned").events.push_back(event);
     }
 }
 
@@ -179,7 +182,7 @@ impl StylusEventReceiver {
 /// Creates the producer and consumer used to retain Android stylus metadata.
 pub fn stylus_event_channel() -> (StylusEventSink, StylusEventReceiver) {
     let state = Arc::new(Mutex::new(StylusEventQueueState::default()));
-    (StylusEventSink { state: Arc::clone(&state) }, StylusEventReceiver { state })
+    (StylusEventSink { state: Arc::downgrade(&state) }, StylusEventReceiver { state })
 }
 
 /// Additional methods on [`EventLoop`] that are specific to Android.

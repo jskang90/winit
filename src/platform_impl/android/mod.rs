@@ -47,9 +47,6 @@ fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
 }
 
 fn source_is_pointer_like(source: Source) -> bool {
-    let raw: u32 = source.into();
-    let has_stylus_source_bit = raw & 0x0000_4000 != 0;
-
     matches!(
         source,
         Source::BluetoothStylus
@@ -57,7 +54,12 @@ fn source_is_pointer_like(source: Source) -> bool {
             | Source::MouseRelative
             | Source::Stylus
             | Source::Touchpad
-    ) || has_stylus_source_bit
+    ) || source_has_stylus_bit(source)
+}
+
+fn source_has_stylus_bit(source: Source) -> bool {
+    let raw: u32 = source.into();
+    raw & 0x0000_4000 != 0
 }
 
 fn source_is_touch_like(source: Source) -> bool {
@@ -76,7 +78,7 @@ fn stylus_tool(source: Source, tool_type: ToolType) -> Option<StylusTool> {
     match tool_type {
         ToolType::Eraser => Some(StylusTool::Eraser),
         ToolType::Stylus => Some(StylusTool::Pen),
-        _ if matches!(source, Source::BluetoothStylus | Source::Stylus) => Some(StylusTool::Pen),
+        _ if source_has_stylus_bit(source) => Some(StylusTool::Pen),
         _ => None,
     }
 }
@@ -328,6 +330,13 @@ impl<T: 'static> EventLoop<T> {
         sink.push(StylusEvent { device_id, pointer_id, position, pressure, tool, kind });
     }
 
+    fn clear_pointer_correlation_state(&mut self) {
+        self.pointer_mouse_buttons.clear();
+        self.pointer_like_contacts.clear();
+        self.stylus_contacts.clear();
+        self.recent_pointer_like = None;
+    }
+
     fn single_iteration<F>(&mut self, main_event: Option<MainEvent<'_>>, callback: &mut F)
     where
         F: FnMut(event::Event<T>, &RootAEL),
@@ -348,6 +357,7 @@ impl<T: 'static> EventLoop<T> {
                     callback(event::Event::Resumed, self.window_target());
                 },
                 MainEvent::TerminateWindow { .. } => {
+                    self.clear_pointer_correlation_state();
                     callback(event::Event::Suspended, self.window_target());
                 },
                 MainEvent::WindowResized { .. } => resized = true,
@@ -367,6 +377,7 @@ impl<T: 'static> EventLoop<T> {
                 },
                 MainEvent::LostFocus => {
                     HAS_FOCUS.store(false, Ordering::Relaxed);
+                    self.clear_pointer_correlation_state();
                     callback(
                         event::Event::WindowEvent {
                             window_id: window::WindowId(WindowId),
@@ -413,6 +424,7 @@ impl<T: 'static> EventLoop<T> {
                 },
                 MainEvent::Pause => {
                     debug!("App Paused - stopped running");
+                    self.clear_pointer_correlation_state();
                     self.running = false;
                 },
                 MainEvent::Stop => {
@@ -1041,8 +1053,8 @@ mod tests {
     use android_activity::input::{Source, ToolType};
 
     use super::{
-        source_is_pointer_like, source_is_touch_like, tool_type_is_pointer_like,
-        tool_type_is_touch_like,
+        source_is_pointer_like, source_is_touch_like, stylus_tool, tool_type_is_pointer_like,
+        tool_type_is_touch_like, StylusTool,
     };
 
     #[test]
@@ -1058,6 +1070,15 @@ mod tests {
         assert!(!source_is_pointer_like(Source::Touchscreen));
         assert!(tool_type_is_touch_like(ToolType::Finger));
         assert!(!tool_type_is_pointer_like(ToolType::Finger));
+    }
+
+    #[test]
+    fn extended_stylus_source_keeps_pen_identity() {
+        let extended_stylus = Source::from(0x0000_4002 | 0x1000_0000);
+
+        assert!(source_is_pointer_like(extended_stylus));
+        assert_eq!(stylus_tool(extended_stylus, ToolType::Unknown), Some(StylusTool::Pen));
+        assert_eq!(stylus_tool(extended_stylus, ToolType::Eraser), Some(StylusTool::Eraser));
     }
 }
 
