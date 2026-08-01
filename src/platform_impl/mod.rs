@@ -3,6 +3,8 @@ use crate::window::Fullscreen as RootFullscreen;
 
 #[cfg(android_platform)]
 mod android;
+#[cfg(any(android_platform, test))]
+mod android_scroll;
 #[cfg(ios_platform)]
 mod ios;
 #[cfg(any(x11_platform, wayland_platform))]

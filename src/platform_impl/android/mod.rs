@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, Source, ToolType};
+use android_activity::input::{
+    Axis, InputEvent, KeyAction, Keycode, MotionAction, Source, ToolType,
+};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -24,6 +26,8 @@ use crate::window::{
     self, CursorGrabMode, CustomCursor, CustomCursorSource, ImePurpose, ResizeDirection, Theme,
     WindowButtons, WindowLevel,
 };
+
+use super::android_scroll::android_mouse_scroll_delta;
 
 mod keycodes;
 
@@ -68,13 +72,12 @@ fn tool_type_is_touch_like(tool_type: ToolType) -> bool {
 }
 
 fn action_is_hover_like(action: MotionAction) -> bool {
-    matches!(
-        action,
-        MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::HoverExit
-    )
+    matches!(action, MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::HoverExit)
 }
 
-fn motion_event_mouse_button(motion_event: &android_activity::input::MotionEvent<'_>) -> event::MouseButton {
+fn motion_event_mouse_button(
+    motion_event: &android_activity::input::MotionEvent<'_>,
+) -> event::MouseButton {
     let button_state = motion_event.button_state();
 
     if button_state.stylus_primary() || button_state.stylus_secondary() || button_state.secondary()
@@ -261,6 +264,9 @@ impl<T: 'static> EventLoop<T> {
              Android",
         );
         let redraw_flag = SharedFlag::new();
+
+        android_app.enable_motion_axis(Axis::Hscroll);
+        android_app.enable_motion_axis(Axis::Vscroll);
 
         Ok(Self {
             android_app: android_app.clone(),
@@ -486,26 +492,25 @@ impl<T: 'static> EventLoop<T> {
                 if let Some(pointer) = pointer {
                     let pointer_id = pointer.pointer_id() as u64;
                     let pointer_key = (raw_device_id, pointer_id);
-                    let location =
-                        PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
-                    let explicit_touch_like =
-                        source_is_touch_like(source) || tool_type_is_touch_like(pointer.tool_type());
-                    let explicit_pointer_like =
-                        source_is_pointer_like(source) || tool_type_is_pointer_like(pointer.tool_type());
+                    let location = PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
+                    let explicit_touch_like = source_is_touch_like(source)
+                        || tool_type_is_touch_like(pointer.tool_type());
+                    let explicit_pointer_like = source_is_pointer_like(source)
+                        || tool_type_is_pointer_like(pointer.tool_type());
                     let known_pointer_like = self.pointer_like_contacts.contains(&pointer_key);
                     let hover_pointer_like = action_is_hover_like(action);
+                    let scroll_pointer_like = action == MotionAction::Scroll;
                     let recent_pointer_like = !explicit_touch_like
-                        && self
-                            .recent_pointer_like
-                            .is_some_and(|recent| {
-                                recent.matches(action, motion_event.pointer_count(), location)
-                            });
+                        && self.recent_pointer_like.is_some_and(|recent| {
+                            recent.matches(action, motion_event.pointer_count(), location)
+                        });
                     let pointer_like = if explicit_touch_like {
-                        known_pointer_like || hover_pointer_like
+                        known_pointer_like || hover_pointer_like || scroll_pointer_like
                     } else {
                         explicit_pointer_like
                             || known_pointer_like
                             || hover_pointer_like
+                            || scroll_pointer_like
                             || recent_pointer_like
                     };
 
@@ -617,7 +622,9 @@ impl<T: 'static> EventLoop<T> {
                             },
                             MotionAction::HoverExit | MotionAction::Cancel => {
                                 self.pointer_like_contacts.remove(&pointer_key);
-                                if let Some(button) = self.pointer_mouse_buttons.remove(&pointer_key) {
+                                if let Some(button) =
+                                    self.pointer_mouse_buttons.remove(&pointer_key)
+                                {
                                     callback(
                                         event::Event::WindowEvent {
                                             window_id,
@@ -638,7 +645,27 @@ impl<T: 'static> EventLoop<T> {
                                     self.window_target(),
                                 );
                             },
-                            MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::Move => {},
+                            MotionAction::Scroll => {
+                                if let Some(delta) = android_mouse_scroll_delta(
+                                    pointer.axis_value(Axis::Hscroll),
+                                    pointer.axis_value(Axis::Vscroll),
+                                ) {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::MouseWheel {
+                                                device_id,
+                                                delta,
+                                                phase: event::TouchPhase::Moved,
+                                            },
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
+                            },
+                            MotionAction::HoverEnter
+                            | MotionAction::HoverMove
+                            | MotionAction::Move => {},
                             _ => {},
                         }
                         return input_status;
