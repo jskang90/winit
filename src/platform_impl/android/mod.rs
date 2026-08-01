@@ -1,12 +1,12 @@
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction};
+use android_activity::input::{InputEvent, KeyAction, Keycode, MotionAction, Source, ToolType};
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
 };
@@ -39,6 +39,96 @@ static HAS_FOCUS: AtomicBool = AtomicBool::new(true);
 /// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
+}
+
+fn source_is_pointer_like(source: Source) -> bool {
+    let raw: u32 = source.into();
+    let has_stylus_source_bit = raw & 0x0000_4000 != 0;
+
+    matches!(
+        source,
+        Source::BluetoothStylus
+            | Source::Mouse
+            | Source::MouseRelative
+            | Source::Stylus
+            | Source::Touchpad
+    ) || has_stylus_source_bit
+}
+
+fn source_is_touch_like(source: Source) -> bool {
+    matches!(source, Source::Touchscreen)
+}
+
+fn tool_type_is_pointer_like(tool_type: ToolType) -> bool {
+    matches!(tool_type, ToolType::Eraser | ToolType::Mouse | ToolType::Stylus)
+}
+
+fn tool_type_is_touch_like(tool_type: ToolType) -> bool {
+    matches!(tool_type, ToolType::Finger)
+}
+
+fn action_is_hover_like(action: MotionAction) -> bool {
+    matches!(
+        action,
+        MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::HoverExit
+    )
+}
+
+fn motion_event_mouse_button(motion_event: &android_activity::input::MotionEvent<'_>) -> event::MouseButton {
+    let button_state = motion_event.button_state();
+
+    if button_state.stylus_primary() || button_state.stylus_secondary() || button_state.secondary()
+    {
+        event::MouseButton::Right
+    } else if button_state.teriary() {
+        event::MouseButton::Middle
+    } else if button_state.back() {
+        event::MouseButton::Back
+    } else if button_state.forward() {
+        event::MouseButton::Forward
+    } else if button_state.primary() {
+        event::MouseButton::Left
+    } else {
+        event::MouseButton::Left
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RecentPointerLike {
+    seen_at: Instant,
+    location: PhysicalPosition<f64>,
+}
+
+impl RecentPointerLike {
+    fn matches(
+        self,
+        action: MotionAction,
+        pointer_count: usize,
+        location: PhysicalPosition<f64>,
+    ) -> bool {
+        if !matches!(
+            action,
+            MotionAction::Down
+                | MotionAction::PointerDown
+                | MotionAction::Move
+                | MotionAction::Up
+                | MotionAction::PointerUp
+        ) {
+            return false;
+        }
+
+        if pointer_count != 1 {
+            return false;
+        }
+
+        if self.seen_at.elapsed() > Duration::from_millis(750) {
+            return false;
+        }
+
+        let dx = self.location.x - location.x;
+        let dy = self.location.y - location.y;
+        dx * dx + dy * dy <= 96.0 * 96.0
+    }
 }
 
 struct PeekableReceiver<T> {
@@ -143,6 +233,9 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    pointer_mouse_buttons: HashMap<(i32, u64), event::MouseButton>,
+    pointer_like_contacts: HashSet<(i32, u64)>,
+    recent_pointer_like: Option<RecentPointerLike>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -192,6 +285,9 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            pointer_mouse_buttons: HashMap::new(),
+            pointer_like_contacts: HashSet::new(),
+            recent_pointer_like: None,
         })
     }
 
@@ -375,9 +471,181 @@ impl<T: 'static> EventLoop<T> {
         match event {
             InputEvent::MotionEvent(motion_event) => {
                 let window_id = window::WindowId(WindowId);
-                let device_id = event::DeviceId(DeviceId(motion_event.device_id()));
+                let raw_device_id = motion_event.device_id();
+                let device_id = event::DeviceId(DeviceId(raw_device_id));
+                let action = motion_event.action();
+                let source = motion_event.source();
 
-                let phase = match motion_event.action() {
+                let pointer = (motion_event.pointer_count() > 0).then(|| {
+                    let pointer_index = motion_event
+                        .pointer_index()
+                        .min(motion_event.pointer_count().saturating_sub(1));
+                    motion_event.pointer_at_index(pointer_index)
+                });
+
+                if let Some(pointer) = pointer {
+                    let pointer_id = pointer.pointer_id() as u64;
+                    let pointer_key = (raw_device_id, pointer_id);
+                    let location =
+                        PhysicalPosition { x: pointer.x() as _, y: pointer.y() as _ };
+                    let explicit_touch_like =
+                        source_is_touch_like(source) || tool_type_is_touch_like(pointer.tool_type());
+                    let explicit_pointer_like =
+                        source_is_pointer_like(source) || tool_type_is_pointer_like(pointer.tool_type());
+                    let known_pointer_like = self.pointer_like_contacts.contains(&pointer_key);
+                    let hover_pointer_like = action_is_hover_like(action);
+                    let recent_pointer_like = !explicit_touch_like
+                        && self
+                            .recent_pointer_like
+                            .is_some_and(|recent| {
+                                recent.matches(action, motion_event.pointer_count(), location)
+                            });
+                    let pointer_like = if explicit_touch_like {
+                        known_pointer_like || hover_pointer_like
+                    } else {
+                        explicit_pointer_like
+                            || known_pointer_like
+                            || hover_pointer_like
+                            || recent_pointer_like
+                    };
+
+                    if !pointer_like {
+                        // fall through to normal touch handling
+                    } else {
+                        if action_is_hover_like(action)
+                            || explicit_pointer_like
+                            || recent_pointer_like
+                        {
+                            self.recent_pointer_like =
+                                Some(RecentPointerLike { seen_at: Instant::now(), location });
+                        }
+
+                        if action_is_hover_like(action)
+                            || source_is_pointer_like(source)
+                            || tool_type_is_pointer_like(pointer.tool_type())
+                        {
+                            self.pointer_like_contacts.insert(pointer_key);
+                        } else if recent_pointer_like {
+                            self.pointer_like_contacts.insert(pointer_key);
+                        }
+
+                        if !matches!(action, MotionAction::HoverExit | MotionAction::Cancel) {
+                            callback(
+                                event::Event::WindowEvent {
+                                    window_id,
+                                    event: event::WindowEvent::CursorMoved {
+                                        device_id,
+                                        position: location,
+                                    },
+                                },
+                                self.window_target(),
+                            );
+                        }
+
+                        match action {
+                            MotionAction::Down | MotionAction::PointerDown => {
+                                let button = motion_event_mouse_button(motion_event);
+                                self.pointer_mouse_buttons.insert(pointer_key, button);
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::MouseInput {
+                                            device_id,
+                                            state: event::ElementState::Pressed,
+                                            button,
+                                        },
+                                    },
+                                    self.window_target(),
+                                );
+                            },
+                            MotionAction::Up | MotionAction::PointerUp => {
+                                self.pointer_like_contacts.remove(&pointer_key);
+                                let button = self
+                                    .pointer_mouse_buttons
+                                    .remove(&pointer_key)
+                                    .unwrap_or_else(|| motion_event_mouse_button(motion_event));
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::MouseInput {
+                                            device_id,
+                                            state: event::ElementState::Released,
+                                            button,
+                                        },
+                                    },
+                                    self.window_target(),
+                                );
+                            },
+                            MotionAction::ButtonPress => {
+                                let button = motion_event_mouse_button(motion_event);
+                                self.pointer_mouse_buttons.insert(pointer_key, button);
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::MouseInput {
+                                            device_id,
+                                            state: event::ElementState::Pressed,
+                                            button,
+                                        },
+                                    },
+                                    self.window_target(),
+                                );
+                            },
+                            MotionAction::ButtonRelease => {
+                                let button = self
+                                    .pointer_mouse_buttons
+                                    .get(&pointer_key)
+                                    .copied()
+                                    .or_else(|| {
+                                        let inferred = motion_event_mouse_button(motion_event);
+                                        (inferred != event::MouseButton::Left).then_some(inferred)
+                                    });
+                                self.pointer_mouse_buttons.remove(&pointer_key);
+                                if let Some(button) = button {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::MouseInput {
+                                                device_id,
+                                                state: event::ElementState::Released,
+                                                button,
+                                            },
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
+                            },
+                            MotionAction::HoverExit | MotionAction::Cancel => {
+                                self.pointer_like_contacts.remove(&pointer_key);
+                                if let Some(button) = self.pointer_mouse_buttons.remove(&pointer_key) {
+                                    callback(
+                                        event::Event::WindowEvent {
+                                            window_id,
+                                            event: event::WindowEvent::MouseInput {
+                                                device_id,
+                                                state: event::ElementState::Released,
+                                                button,
+                                            },
+                                        },
+                                        self.window_target(),
+                                    );
+                                }
+                                callback(
+                                    event::Event::WindowEvent {
+                                        window_id,
+                                        event: event::WindowEvent::CursorLeft { device_id },
+                                    },
+                                    self.window_target(),
+                                );
+                            },
+                            MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::Move => {},
+                            _ => {},
+                        }
+                        return input_status;
+                    }
+                }
+
+                let phase = match action {
                     MotionAction::Down | MotionAction::PointerDown => {
                         Some(event::TouchPhase::Started)
                     },
@@ -620,6 +888,31 @@ impl<T: 'static> EventLoop<T> {
 
     fn exiting(&self) -> bool {
         self.window_target.p.exiting()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use android_activity::input::{Source, ToolType};
+
+    use super::{
+        source_is_pointer_like, source_is_touch_like, tool_type_is_pointer_like,
+        tool_type_is_touch_like,
+    };
+
+    #[test]
+    fn unknown_tool_type_is_not_treated_as_pointer_like() {
+        assert!(!tool_type_is_pointer_like(ToolType::Unknown));
+        assert!(tool_type_is_pointer_like(ToolType::Stylus));
+        assert!(tool_type_is_pointer_like(ToolType::Mouse));
+    }
+
+    #[test]
+    fn touchscreen_finger_input_stays_touch_like() {
+        assert!(source_is_touch_like(Source::Touchscreen));
+        assert!(!source_is_pointer_like(Source::Touchscreen));
+        assert!(tool_type_is_touch_like(ToolType::Finger));
+        assert!(!tool_type_is_pointer_like(ToolType::Finger));
     }
 }
 
