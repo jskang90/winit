@@ -579,6 +579,8 @@ impl<T: 'static> EventLoop<T> {
                     let current_stylus_tool = stylus_tool(source, pointer.tool_type())
                         .or_else(|| self.stylus_contacts.get(&pointer_key).copied());
                     let explicit_finger = tool_type_is_touch_like(pointer.tool_type());
+                    let explicit_pointer_like = source_is_pointer_like(source)
+                        || tool_type_is_pointer_like(pointer.tool_type());
                     let known_pointer_like = self.pointer_like_contacts.contains(&pointer_key);
                     let hover_pointer_like = action_is_hover_like(action);
                     let scroll_pointer_like = action == MotionAction::Scroll;
