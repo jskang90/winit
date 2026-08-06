@@ -94,6 +94,35 @@ fn action_is_hover_like(action: MotionAction) -> bool {
     matches!(action, MotionAction::HoverEnter | MotionAction::HoverMove | MotionAction::HoverExit)
 }
 
+fn input_is_pointer_like(
+    source: Source,
+    tool_type: ToolType,
+    known_pointer_like: bool,
+    hover_pointer_like: bool,
+    scroll_pointer_like: bool,
+    recent_pointer_like: bool,
+) -> bool {
+    // Android pointer identifiers are only unique for the lifetime of a contact. A pen hover and
+    // a later finger contact can therefore reuse the same `(device_id, pointer_id)`. The explicit
+    // tool type must win over the cached identity or that finger loses its Touch Started/Ended
+    // events and is emitted as a mouse/stylus pointer instead.
+    if tool_type_is_touch_like(tool_type) {
+        return hover_pointer_like || scroll_pointer_like;
+    }
+    if tool_type_is_pointer_like(tool_type) {
+        return true;
+    }
+    if source_is_touch_like(source) {
+        hover_pointer_like || scroll_pointer_like
+    } else {
+        source_is_pointer_like(source)
+            || known_pointer_like
+            || hover_pointer_like
+            || scroll_pointer_like
+            || recent_pointer_like
+    }
+}
+
 fn motion_event_mouse_button(
     motion_event: &android_activity::input::MotionEvent<'_>,
 ) -> event::MouseButton {
@@ -549,28 +578,32 @@ impl<T: 'static> EventLoop<T> {
                     let pressure = pointer.pressure();
                     let current_stylus_tool = stylus_tool(source, pointer.tool_type())
                         .or_else(|| self.stylus_contacts.get(&pointer_key).copied());
-                    let explicit_touch_like = source_is_touch_like(source)
-                        || tool_type_is_touch_like(pointer.tool_type());
-                    let explicit_pointer_like = source_is_pointer_like(source)
-                        || tool_type_is_pointer_like(pointer.tool_type());
+                    let explicit_finger = tool_type_is_touch_like(pointer.tool_type());
                     let known_pointer_like = self.pointer_like_contacts.contains(&pointer_key);
                     let hover_pointer_like = action_is_hover_like(action);
                     let scroll_pointer_like = action == MotionAction::Scroll;
-                    let recent_pointer_like = !explicit_touch_like
+                    let recent_pointer_like = !explicit_finger
                         && self.recent_pointer_like.is_some_and(|recent| {
                             recent.matches(action, motion_event.pointer_count(), location)
                         });
-                    let pointer_like = if explicit_touch_like {
-                        known_pointer_like || hover_pointer_like || scroll_pointer_like
-                    } else {
-                        explicit_pointer_like
-                            || known_pointer_like
-                            || hover_pointer_like
-                            || scroll_pointer_like
-                            || recent_pointer_like
-                    };
+                    let pointer_like = input_is_pointer_like(
+                        source,
+                        pointer.tool_type(),
+                        known_pointer_like,
+                        hover_pointer_like,
+                        scroll_pointer_like,
+                        recent_pointer_like,
+                    );
 
                     if !pointer_like {
+                        // A definitive finger contact may reuse a key that belonged to an earlier
+                        // pen contact. Do not let that stale cached identity affect its later Up.
+                        if explicit_finger {
+                            self.pointer_like_contacts.remove(&pointer_key);
+                            self.pointer_mouse_buttons.remove(&pointer_key);
+                            self.pointer_cursor_positions.remove(&pointer_key);
+                            self.stylus_contacts.remove(&pointer_key);
+                        }
                         // fall through to normal touch handling
                     } else {
                         if action_is_hover_like(action)
@@ -1075,8 +1108,9 @@ mod tests {
     use android_activity::input::{Source, ToolType};
 
     use super::{
-        emits_standalone_button_action, source_is_pointer_like, source_is_touch_like, stylus_tool,
-        tool_type_is_pointer_like, tool_type_is_touch_like, StylusTool,
+        emits_standalone_button_action, input_is_pointer_like, source_is_pointer_like,
+        source_is_touch_like, stylus_tool, tool_type_is_pointer_like, tool_type_is_touch_like,
+        StylusTool,
     };
 
     #[test]
@@ -1092,6 +1126,30 @@ mod tests {
         assert!(!source_is_pointer_like(Source::Touchscreen));
         assert!(tool_type_is_touch_like(ToolType::Finger));
         assert!(!tool_type_is_pointer_like(ToolType::Finger));
+    }
+
+    #[test]
+    fn finger_identity_wins_over_a_reused_pen_pointer_id() {
+        assert!(!input_is_pointer_like(
+            Source::Touchscreen,
+            ToolType::Finger,
+            true,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn stylus_tool_on_a_touchscreen_source_stays_pointer_like() {
+        assert!(input_is_pointer_like(
+            Source::Touchscreen,
+            ToolType::Stylus,
+            false,
+            false,
+            false,
+            false,
+        ));
     }
 
     #[test]
